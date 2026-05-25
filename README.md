@@ -104,11 +104,14 @@ this is the canonical license, no internal subdirectory overrides.
 ## Citation
 
 ```bibtex
-@article{dcr-attention-v3,
-  title = {DCR-attention: top-K sparse attention for long-context decode
-           on Llama-3.2-1B},
-  year  = {2026},
-  note  = {Zenodo DOI / arXiv ID to be added upon Phase 7.2 / 7.3 deposit}
+@misc{dcr-attention-v3,
+  title  = {DCR-attention: Top-K Sparse Attention for Long-Context Decode
+            on Llama-3.2-1B (v3 Release)},
+  author = {Seqev},
+  year   = {2026},
+  doi    = {10.5281/zenodo.20385784},
+  url    = {https://doi.org/10.5281/zenodo.20385784},
+  
 }
 ```
 
