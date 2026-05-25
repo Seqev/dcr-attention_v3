@@ -1,0 +1,627 @@
+# Kernel Specification — Top-K Q-Axis Fused Decode Attention
+
+**Milestone:** M0 (specification only; no implementation)
+**Date:** 2026-05-07
+**Architecture target:** Ubuntu 22.04 WSL2, RTX 4060 Ti (16 GB, compute capability 8.9)
+**Model reference:** meta-llama/Llama-3.2-1B (verified via AutoConfig 2026-05-07)
+**transformers version pinned:** 5.6.2
+
+This document is the written contract for what the kernel must do. All downstream
+milestones (M1 Python reference, M2/M3 Triton kernel, M5 validation suite) are
+checked against this spec by section number. Do not modify this file without
+architect review.
+
+---
+
+## §1. Inputs and Outputs
+
+### §1.1 Model dimensions (Llama-3.2-1B, locked)
+
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| `num_hidden_layers` | 16 | AutoConfig |
+| `num_attention_heads` (H) | 32 | AutoConfig |
+| `num_key_value_heads` (H_kv) | 8 | AutoConfig — GQA factor of 4 |
+| `head_dim` (D) | 64 | hidden_size(2048) / H(32) |
+| `hidden_size` | 2048 | AutoConfig |
+| `max_position_embeddings` | 131072 | AutoConfig |
+
+GQA mapping: each KV head serves `H / H_kv = 4` query heads.
+For query head `h`, the corresponding KV head is `h_kv = h // 4`.
+
+### §1.2 Input tensors
+
+| Tensor | Shape | Dtype | Layout | Notes |
+|--------|-------|-------|--------|-------|
+| `Q` | `[B, H, D]` | bf16 | row-major contiguous | Single decode token, post-RoPE |
+| `K_cache` | `[B, H_kv, N, D]` | bf16 | row-major contiguous in N | DynamicCache layer extract |
+| `V_cache` | `[B, H_kv, N, D]` | bf16 | row-major contiguous in N | DynamicCache layer extract |
+
+### §1.3 Output tensor
+
+| Tensor | Shape | Dtype | Layout |
+|--------|-------|-------|--------|
+| `O` | `[B, H, D]` | bf16 | row-major contiguous |
+
+### §1.4 Scalar inputs
+
+| Name | Type | Description |
+|------|------|-------------|
+| `k_eff` | int | Effective top-K window size: `max(k_min, ceil(c_floor * N))` |
+| `c_floor` | float ∈ (0,1] | Coverage floor (e.g., 0.5); used by caller to compute k_eff |
+| `k_min` | int | Minimum window size, default 64 (equals T_dispatch in DCRLlamaConfig) |
+
+### §1.5 Regime
+
+- B: 1–8 (Track 3: B=4 stable, B=8 OOM in Python path; Triton kernel target: B=1–8)
+- N: 64–20000 (validated range; architectural max 131072)
+- k_eff: k_min to min(N, 10000) at c_floor=0.5, N=20K
+
+---
+
+## §2. Algorithmic Steps
+
+This section specifies the **logical algorithm** — what the kernel computes.
+The **physical execution strategy** (how the computation is mapped to GPU
+SMs and SRAM tiers) is specified in §4.4. The M1 Python reference
+(unconstrained by SRAM) implements §2 directly. The M2/M3 Triton kernel
+implements §4.4 (which is functionally equivalent to §2, but split across
+multiple kernel launches for SRAM reasons).
+
+In particular: §2 Step 2 describes top-K selection as a streaming heap update
+during projection. §4.4 splits this into Pass 1 (projection → scores in HBM)
+and Pass 2 (top-K of HBM scores array). Both produce the same `topk_indices`
+result; the split exists because the heap exceeds SRAM at k_eff ≥ 8K.
+
+Pseudocode at sufficient detail for M1 Python reference to be implemented from
+this spec alone without reading the existing Python implementation.
+
+```
+Algorithm: Top-K Q-Axis Fused Decode Attention
+Input:  Q       [B, H, D]         bf16
+        K_cache [B, H_kv, N, D]   bf16
+        V_cache [B, H_kv, N, D]   bf16
+        k_eff   int
+Output: O       [B, H, D]         bf16
+
+Constants: B_block = 64, eps = 1e-12
+
+# ── Step 0: Degenerate case ─────────────────────────────────────────────────
+if N <= k_eff:
+    # Caller (M4 integration layer) handles fallback to standard SDPA;
+    # this kernel is not invoked in this regime.
+    # Documented at §6 ("N ≤ k_eff (sparse regime)") and §9.3 (scope lock).
+    raise ValueError("kernel invoked with N ≤ k_eff; caller must dispatch to SDPA")
+
+# ── Step 1: Compute unit Q vector per (b, h) ────────────────────────────────
+for b in range(B):
+    for h in range(H):
+        q_f32 = Q[b, h, :].to(fp32)                    # [D] fp32
+        norm = sqrt(sum(q_f32 * q_f32)) + eps           # scalar fp32
+        u_Q[b, h, :] = q_f32 / norm                     # [D] fp32
+        # u_Q computed once; reused in Step 2 and Step 4
+
+# ── Step 2: Stream K_cache, project, maintain top-K heap ────────────────────
+for b in range(B):
+    for h in range(H):
+        h_kv = h // (H // H_kv)                        # GQA: 4 Q heads per KV head
+
+        # Initialize heap: k_eff slots, score=-inf, index=-1
+        topk_scores  = [-inf] * k_eff                   # bf16
+        topk_indices = [-1]   * k_eff                   # int32
+
+        for tile_start in range(0, N, B_block):
+            tile_end = min(tile_start + B_block, N)
+            K_tile = K_cache[b, h_kv, tile_start:tile_end, :]  # [tile_sz, D] bf16
+
+            for i in range(tile_start, tile_end):
+                # Promote K row to fp32, dot with u_Q
+                k_row_f32  = K_tile[i - tile_start, :].to(fp32)  # [D] fp32
+                score_f32  = sum(k_row_f32 * u_Q[b, h, :])       # scalar fp32
+                score_bf16 = score_f32.to(bf16)                   # for heap key
+
+                # Heap replacement: maintain top-k_eff by score_bf16
+                # Tie-break: smaller original index wins (stable, deterministic)
+                heap_min_score, heap_min_pos = min_of(topk_scores)
+                if score_bf16 > heap_min_score or (
+                    score_bf16 == heap_min_score and i < topk_indices[heap_min_pos]
+                ):
+                    topk_scores[heap_min_pos]  = score_bf16
+                    topk_indices[heap_min_pos] = i
+
+        # Sort selected indices in ascending order (required for Step 4 tiling)
+        topk_indices[b, h, :] = sort(topk_indices)     # [k_eff] int32, ascending
+
+# ── Step 3: Gather selected K, V ────────────────────────────────────────────
+for b in range(B):
+    for h in range(H):
+        h_kv = h // (H // H_kv)
+        K_sel[b, h, :, :] = K_cache[b, h_kv, topk_indices[b, h, :], :]  # [k_eff, D] bf16
+        V_sel[b, h, :, :] = V_cache[b, h_kv, topk_indices[b, h, :], :]  # [k_eff, D] bf16
+
+# ── Step 4: Fused softmax-attention-output (FlashAttention online algorithm) ─
+scale = 1.0 / sqrt(float(D))   # fp32 constant
+
+for b in range(B):
+    for h in range(H):
+        m = -inf   # running max, fp32
+        l = 0.0    # running denominator (sum of exp), fp32
+        o = zeros(D, dtype=fp32)   # running output accumulator, fp32
+
+        for tile_start in range(0, k_eff, B_block):
+            tile_end = min(tile_start + B_block, k_eff)
+            K_blk = K_sel[b, h, tile_start:tile_end, :].to(fp32)  # [B_block, D]
+            V_blk = V_sel[b, h, tile_start:tile_end, :].to(fp32)  # [B_block, D]
+
+            # Attention scores for this tile (uses unnormalized Q, not u_Q)
+            scores = (K_blk @ Q[b, h, :].to(fp32)) * scale   # [B_block] fp32
+
+            # Online softmax update
+            m_new = max(m, max(scores))              # fp32
+            alpha = exp(m - m_new)                   # fp32 rescale for old state
+            beta  = exp(scores - m_new)              # [B_block] fp32
+
+            l = alpha * l + sum(beta)                # fp32
+            o = alpha * o + (beta @ V_blk)           # [D] fp32 (beta [B_block] · V_blk [B_block,D])
+            m = m_new
+
+        # Final normalization and output demotion
+        O[b, h, :] = (o / l).to(bf16)               # [D] bf16
+
+return O
+```
+
+**Implementation note (Step 4 ambiguity resolved):** `u_Q` is used in Step 2
+(dispatch) only. Step 4 (attention scores) uses the original Q vector promoted to
+fp32 directly — `Q[b,h,:].to(fp32)`. The two uses are independent: u_Q is for
+top-K key selection; Q (unnormalized) is for computing attention weights.
+
+---
+
+## §3. Numerical Boundaries — Risk R3 Mitigation
+
+**This section is the primary deliverable of M0.** Every operation in §2 gets an
+explicit dtype contract. This table is the hard-fix — neither M2/M3 Triton
+implementation nor any future optimization may demote any fp32 boundary listed
+here without a spec revision and architect sign-off.
+
+**Default rule:** fp32 for any reduction or accumulation; bf16 only for HBM I/O
+and broadcasted multiplications. When in doubt: fp32.
+
+| Op | Input dtype | Compute dtype | Output dtype | Justification |
+|----|-------------|---------------|--------------|---------------|
+| `u_Q = Q / ‖Q‖₂` (norm) | bf16 (Q) | **fp32** (norm + division) | **fp32** (u_Q) | bf16 norm has ~12% tie rate at D=64 (Paper 1 §B.2, §C.1); fp32 required throughout dispatch chain |
+| `K_tile · u_Q` (projection score) | bf16 × fp32 | **fp32** accumulator (dot product) | bf16 (heap key) | K promoted to fp32 in projection einsum; back to bf16 only as top-K comparison key — precision loss here is tolerable (selection criterion, not softmax) |
+| top-K heap comparison | bf16 scores, int32 indices | bf16 compare | int32 indices | Tie-break: stable ordering, smaller original index wins; deterministic across runs |
+| `Q[b,h,:].to(fp32) · K_sel` (attention scores) | bf16 × bf16 → fp32 | **fp32** accumulator | fp32 logits | Standard FlashAttention pattern; never demote to bf16 between K multiply and softmax |
+| running max `m` | fp32 logits | **fp32** | fp32 | **Critical R3 boundary:** bf16 max state breaks online softmax at long context; see quantitative analysis below |
+| running denominator `l` | fp32 | **fp32** | fp32 | Same — bf16 sum loses relative accuracy; see analysis below |
+| `exp(scores − m_new)` | fp32 | **fp32** | fp32 | bf16 exp has 1-bit effective mantissa in many ranges; unusable for softmax normalization |
+| running output `o` | fp32 | **fp32** | fp32 | Same reasoning as `l`; never touch bf16 before final divide |
+| `o / l` (final normalization) | fp32 | fp32 | **bf16** | Single demotion at kernel output boundary — all numerical work complete |
+| scale `1/sqrt(D)` | — | fp32 constant | fp32 | Compile-time constant; no casting error |
+
+### §3.1 Three additional invariants
+
+1. **Q is promoted to fp32 once** (Step 1 for u_Q, Step 4 for attention scores). Do
+   not re-promote from bf16 per tile — this would re-introduce the original bf16
+   rounding error on each promotion.
+
+2. **Online softmax state (m, l, o) never touches bf16**, even in the spill-to-HBM
+   path (Option B pass boundary; see §4.3). When passes exchange state, they exchange
+   fp32 values.
+
+3. **K and V are bf16 in HBM** (storage format only). They are always promoted to
+   fp32 in SRAM before any arithmetic. No bf16 arithmetic in the kernel hot path.
+
+### §3.2 Quantitative justification for fp32 running state
+
+At N = 20K with c_floor = 0.5, k_eff = 10000. The inner softmax accumulates over
+10000 terms in `l` and `o`.
+
+**bf16 running sum error bound:**
+bf16 has 7-bit mantissa → machine epsilon ε₇ = 2⁻⁷ ≈ 0.0078.
+For a sum of k terms, worst-case accumulation error ≈ O(√k · ε₇).
+At k = 10000: error ≈ √10000 · 2⁻⁷ = 100 · 0.0078 ≈ **0.78 relative error**.
+This is catastrophic — would dominate the +0.31% PPL budget we observed in H.1.B.
+
+**fp32 running sum error bound:**
+fp32 has 23-bit mantissa → machine epsilon ε₂₃ = 2⁻²³ ≈ 1.2×10⁻⁷.
+At k = 10000: error ≈ √10000 · 2⁻²³ = 100 · 1.2×10⁻⁷ ≈ **1.2×10⁻⁵ relative error**.
+Three orders of magnitude below the PPL budget. fp32 is sufficient.
+
+**Conclusion:** bf16 running softmax state is completely unusable at k_eff ≥ 1000.
+fp32 is the only viable option.
+
+---
+
+## §4. Block Size and SRAM Budget
+
+**Target hardware:** RTX 4060 Ti, compute capability 8.9.
+- Shared memory per SM: 128 KB (configurable; 100 KB + 28 KB L1, or all 128 KB shared)
+- Number of SMs: 36
+- HBM bandwidth: 288 GB/s
+- HBM capacity: 16 GB
+
+### §4.1 Block size
+
+**B_block = 64 keys per tile.** Rationale:
+- 64 is a standard warp-multiple for Triton; divides cleanly into k_eff at all scales
+- Smaller blocks increase kernel launch/loop overhead; larger blocks exceed SRAM
+
+### §4.2 Per-(b,h) thread group SRAM usage
+
+| Component | Size | Notes |
+|-----------|------|-------|
+| Q vector (fp32, cached for Step 4) | 64 × 4 = 256 B | Read once, reused per tile |
+| u_Q vector (fp32, cached for Step 2) | 64 × 4 = 256 B | Read once, reused per tile |
+| K_tile (fp32, after promotion) | 64 × 64 × 4 = 16 384 B | One tile at a time |
+| V_tile (fp32, during Step 4) | 64 × 64 × 4 = 16 384 B | One tile at a time |
+| Online softmax state (m, l, o) | 4 + 4 + 64×4 = 264 B | Persistent across tiles |
+| **Top-K heap during Step 2** | k_eff × 8 B | score(bf16, 2B) + index(int32, 4B); 8B per entry assuming standard struct alignment |
+| **Total (fixed, excl. heap)** | **≈ 33 KB** | |
+
+### §4.3 Top-K heap SRAM analysis
+
+| k_eff | Heap size | Total SRAM | Fits in 128 KB? |
+|-------|-----------|------------|-----------------|
+| 64 | 512 B | ~33.5 KB | ✓ comfortable |
+| 1 024 | 8 KB | ~41 KB | ✓ |
+| 4 096 | 32 KB | ~65 KB | ✓ |
+| 8 192 | 64 KB | ~97 KB | ⚠ tight |
+| **10 000** | **80 KB** | **~113 KB** | **✗ will spill registers** |
+| 16 384 | 128 KB | ~161 KB | ✗ exceeds budget |
+
+**For Llama-3.2-1B at N = 20K, c_floor = 0.5 → k_eff = 10 000. This exceeds the
+safe SRAM budget.** A two-pass strategy is required.
+
+### §4.4 Decision: Option A vs Option B
+
+#### Option A — Spill top-K heap to HBM (rejected)
+The heap lives in HBM. Each of the N key projections in Step 2 requires:
+- 1 HBM read (current min of heap)
+- 1 HBM compare
+- 1 HBM conditional write
+
+For N = 20K, this is 20K × 3 HBM random accesses per (b, h). With 32 Q heads and
+batch B, the HBM random-access pattern kills effective bandwidth (256-byte cache
+line waste). The bandwidth penalty wipes most of the speedup over Python masked-dense.
+
+#### Option B — Two-pass kernel (chosen) ✓
+
+**Pass 1 — Score projection (bandwidth-bound):**
+Stream all N keys sequentially through SRAM, compute dot-product with u_Q, write
+scores to HBM as a contiguous float16 array of shape `[B, H, N]`.
+SRAM per pass: K_tile (16 KB) + u_Q (256 B) + score_tile (128 B) = ~16.5 KB.
+HBM write: B × H × N × 2 bytes = at N=20K, B=1: 32 × 20K × 2 = 1.28 MB (negligible).
+
+**Pass 2 — Top-K selection:**
+Read scores `[B, H, N]` from HBM (1.28 MB at N=20K), apply `torch.topk` or
+Triton bitonic sort to obtain indices `[B, H, k_eff]`. This pass operates on
+a small array and is fast (scores array ≪ KV cache).
+
+**Pass 3 — Gather + fused FlashAttention (compute-bound):**
+Gather K_sel, V_sel using indices. Run Step 4 online softmax over k_eff keys.
+SRAM: K_tile + V_tile + softmax state = ~33 KB, well within budget.
+
+**Decision: Option B is locked.** Reasons:
+1. Pass 1 is already bandwidth-bound (must read all K regardless); no extra cost
+2. Scores array at N=20K is only 1.28 MB — negligible HBM overhead
+3. SRAM headroom preserved for future scaling (N=64K → k_eff=32K → Option B still works)
+4. Clean pass boundaries enable independent micro-benchmarking and testing
+5. Pass 2 top-K is a solved problem with highly optimized Triton implementations
+
+**Single-pass exception:** for k_eff ≤ 4096 (i.e., N ≤ ~8192 at c_floor=0.5), the
+heap fits in SRAM (≤ 65 KB total). M2 implementation MAY use a single-pass path for
+this regime. The M2 kernel must select the pass strategy at kernel launch time based
+on k_eff, not context.
+
+---
+
+## §5. Equivalence Claim
+
+This section defines what M5 validation verifies. Three tiers. No bitwise-identical
+claim (impossible with bf16 non-associative reductions).
+
+Tier 1 (numerical equivalence) is split into §5.1.1 (intermediate tensors —
+Pass 1 scores, Pass 2 indices) and §5.1.2 (final output O), reflecting the
+distinct noise sources at each stage of the pipeline.
+
+### Tier 1 — Numerical equivalence
+
+Different kernels in the pipeline produce different tensor types with different
+sources of numerical noise. Tier 1 thresholds are split per tensor type to
+calibrate against the actual physical minimum for each.
+
+#### §5.1.1 Intermediate tensor tolerance (Pass 1 scores, Pass 2 indices)
+
+For **Pass 1 scores** `[B, H, N]` bf16, comparing M2 Triton output vs M1 reference:
+
+```
+max |scores_triton - scores_ref|_∞  ≤  1.0e-2    (≤ 2 bf16 ULP at projection magnitude)
+mean (scores_triton - scores_ref)²   ≤  1e-6     (RMSE² floor)
+```
+
+**Justification.** bf16 ULP at magnitude ~1.0 is exactly 0.0078125 (= 7.8e-3).
+Different reduction orders between cuBLAS (M1's `torch.einsum`) and Triton
+(`tl.sum` element-wise) produce results that differ by ≤1 ULP for identical
+fp32 input. This is the physical minimum given non-associative bf16 arithmetic;
+algorithmic equivalence cannot be tightened further without locking reduction
+order across kernels (which would defeat Triton's parallelism).
+
+The 2-ULP threshold (1.0e-2) provides headroom for cumulative cross-tile
+variance while still being tight enough to catch genuine algorithmic divergence.
+
+For **Pass 2 indices** `[B, H, k_eff]` int32:
+
+```
+exact_match(indices_triton, indices_ref) ≥ 99.9% of (b, h) tuples
+```
+
+Note: indices are integer; "tolerance" applies as exact-match fraction, not
+distance metric. The 0.1% allowance covers bf16 ties at window boundary
+where stable tie-break might differ across reduction orders.
+
+#### §5.1.2 Final output tolerance (Pass 3 / full kernel output O)
+
+For **final output O** `[B, H, D]` bf16, comparing fused-pipeline Triton output
+vs M1 end-to-end reference:
+
+```
+max |O_triton - O_ref|_∞  ≤  5e-3      (original threshold, unchanged)
+mean (O_triton - O_ref)²   ≤  1e-6     (RMSE² floor)
+```
+
+**Justification.** Final output O has been through softmax + attention-weighted
+sum, which **dampens** intermediate score noise: a 1-ULP perturbation in scores
+produces a sub-ULP perturbation in softmax probabilities (because softmax is
+local-Lipschitz with constant ≤1 in logit space), which produces a vanishing
+perturbation in the weighted V sum. Therefore the 5e-3 threshold (~⅔ ULP at
+output magnitude) is achievable for the fused pipeline output even though
+intermediate scores tolerance is 2 ULPs.
+
+The asymmetry between §5.1.1 (intermediate) and §5.1.2 (output) is expected
+and correct: intermediate tensors exhibit reduction-order noise; final output
+exhibits softmax-dampened noise.
+
+#### Threshold application by milestone
+
+| Milestone | Output tested | Tier 1 threshold |
+|-----------|---------------|------------------|
+| M2 Pass 1 (projection) | scores `[B, H, N]` | §5.1.1 (≤ 1.0e-2 max, ≤ 1e-6 RMSE²) |
+| M2 Pass 2 (top-K) | indices `[B, H, k_eff]` | §5.1.1 (≥ 99.9% exact match) |
+| M3 Pass 3 (fused attention) | O `[B, H, D]` | §5.1.2 (≤ 5e-3 max, ≤ 1e-6 RMSE²) |
+| M5 end-to-end validation | O `[B, H, D]` | §5.1.2 |
+
+Thresholds calibrated to bf16 cumulative noise per Paper 1 §A.3 cross-validation.
+
+### Tier 2 — Statistical PPL equivalence
+
+End-to-end PPL on N = 5000 WikiText-2 trace (Llama-3.2-1B):
+
+```
+|PPL_triton - PPL_python_ref| / PPL_python_ref  ≤ 5×10⁻⁴   (0.05%)
+```
+
+Comparison baseline is **M1 Python top-K reference** (this spec §8), not the
+current Python rank-window implementation. The architectural improvement (top-K
+vs rank-window) accounts for ~0.1–0.2% PPL difference; that is the claimed gain,
+not a bug to be nulled out.
+
+### Tier 3 — Algorithmic invariants
+
+For each `(b, h, decode_step)` tuple over a representative N=5000 trace:
+
+```
+Jaccard(S_triton, S_ref) = 1.0   for ≥ 99.9% of tuples      (index set agreement)
+cos(u_Q_triton, u_Q_ref) ≥ 0.9999                            (Q-axis alignment)
+|S_triton| = k_eff   exactly                                  (no off-by-one in selection size)
+```
+
+The 0.1% index disagreement tolerance covers bf16 score ties at the k_eff boundary
+(two keys with identical bf16 score; either is valid). Ties are resolved by smaller
+index (§6), but the Triton implementation may encounter reordering due to parallel
+heap updates — the 0.1% budget accommodates this.
+
+### Bitwise equality: explicitly NOT claimed
+
+bf16 reduction order is non-associative; CUDA Tensor Core schedules vary across
+kernel launches; parallel heap merges in Triton are non-deterministic within a warp.
+Bitwise equality would require disabling Tensor Cores (~3× perf regression) and
+sequential warp reduction, negating the purpose of the kernel. Claims 1–3 above
+are sufficient for production deployment.
+
+---
+
+## §6. Ties and Edge Cases
+
+| Case | Specification |
+|------|---------------|
+| **bf16 score ties at k_eff boundary** | Stable ordering: smaller original index preferred. Deterministic across runs, even across parallel warp execution (secondary sort by index after all scores computed in Pass 1). |
+| **Zero query** (‖Q[b,h,:]‖₂ < 10⁻¹²) | Clamp norm to `eps = 10⁻¹²` before division (invariant: norm ≥ eps at all times). Resulting u_Q is near-arbitrary; kernel proceeds. Do NOT raise error — zero queries occur in padding contexts. |
+| **N ≤ k_eff** (sparse regime) | Set `k_eff_actual = min(k_eff, N)` inside kernel. Returns full dense attention over all N keys. Outer code may rely on this — no guard needed at the call site. |
+| **N < B_block** (N < 64) | Pass 1 processes a single partial tile; heap merge handles partial array. No special case needed if tile loop uses `tile_end = min(tile_start + B_block, N)`. |
+| **B=1, H=1** (unit batch/head) | Kernel must handle without implicit broadcasting. Explicitly tested in M5 validation. |
+| **Empty K_cache** (N=0) | Undefined behavior for this kernel. The outer attention layer must not call the kernel when N=0. `T_dispatch=64` in DCRLlamaConfig guarantees N ≥ 64 before dispatch is enabled. |
+| **Numerical overflow in exp** | The `m` subtraction (`exp(scores - m_new)`) prevents overflow in fp32 for any finite input. M1 reference must verify no NaN/inf on representative 5000-token trace. |
+| **k_eff = 0** | Invalid. Caller must guarantee k_eff ≥ k_min = 64. Raise ValueError at Python boundary; not handled in Triton kernel. |
+| **H not divisible by H_kv** | Invalid for Llama-3.2-1B (32 / 8 = 4 exactly). Enforce `assert H % H_kv == 0` at kernel launch. |
+
+---
+
+## §7. Memory Layout Assumptions
+
+### §7.1 KV cache layout (pinned to transformers 5.6.2)
+
+HuggingFace `DynamicCache` (and `StaticCache`) at transformers 5.6.2 produces:
+
+```
+K_cache[layer_idx]: shape [B, H_kv, N, D], dtype bfloat16
+    stride = (H_kv * N * D,  N * D,  D,  1)   # row-major, contiguous in N
+V_cache[layer_idx]: same shape and stride
+```
+
+The N dimension is **contiguous** (stride = D in last two dims). This is required
+for the sequential tile scan in Pass 1. The kernel MUST verify
+`K_cache.is_contiguous()` at call time and raise if not.
+
+If transformers upgrades to a paged or non-contiguous cache layout (e.g., PagedAttention
+or newer BlockSparseCache), an adapter layer must materialize a contiguous copy before
+calling the kernel. This adapter is out of scope for M2/M3; document as future work.
+
+### §7.2 Q tensor layout
+
+Q is the `[B, H, D]` slice from the full model attention computation, post-RoPE.
+The monkey-patch layer (`dcr_attention/models/llama/attention.py`) squeezes the
+sequence dimension before calling this kernel. Q is contiguous by construction.
+
+### §7.3 Output layout
+
+The kernel writes O as a contiguous `[B, H, D]` bf16 tensor. The caller
+(monkey-patch) is responsible for inserting the sequence dimension back.
+
+### §7.4 CUDA stream
+
+No assumption beyond the default CUDA stream provided by `model.forward()`. The
+kernel must work on the default stream without explicit synchronization.
+
+---
+
+## §8. Reference Implementation Hooks
+
+M1 must implement the following exact signatures. These signatures are the contract
+between M1 reference and M2/M3 Triton kernels. Any change requires spec revision.
+
+```python
+def topk_qaxis_attention_reference(
+    Q: torch.Tensor,        # [B, H, D]        dtype=torch.bfloat16, contiguous
+    K_cache: torch.Tensor,  # [B, H_kv, N, D]  dtype=torch.bfloat16, contiguous in N
+    V_cache: torch.Tensor,  # [B, H_kv, N, D]  dtype=torch.bfloat16, contiguous in N
+    k_eff: int,
+    *,
+    eps: float = 1e-12,
+) -> torch.Tensor:          # [B, H, D]  dtype=torch.bfloat16, contiguous
+    """
+    Top-K Q-axis fused decode attention — pure PyTorch reference implementation.
+
+    Implements the Algorithm in kernel_spec.md §2 with exact dtype boundaries
+    from kernel_spec.md §3. Correct but not optimized for speed.
+
+    Used as ground truth for M5 validation. If M5 disagrees with this function,
+    the spec (§2/§3) is wrong — not the kernel.
+
+    Must run on both CUDA and CPU (for unit tests without GPU).
+    """
+    ...
+
+
+def topk_qaxis_attention_triton(
+    Q: torch.Tensor,        # [B, H, D]        dtype=torch.bfloat16, contiguous
+    K_cache: torch.Tensor,  # [B, H_kv, N, D]  dtype=torch.bfloat16, contiguous in N
+    V_cache: torch.Tensor,  # [B, H_kv, N, D]  dtype=torch.bfloat16, contiguous in N
+    k_eff: int,
+    *,
+    eps: float = 1e-12,
+    block_size: int = 64,
+) -> torch.Tensor:          # [B, H, D]  dtype=torch.bfloat16, contiguous
+    """
+    Top-K Q-axis fused decode attention — Triton kernel (M2/M3).
+
+    Same interface as topk_qaxis_attention_reference. Uses two-pass strategy
+    for k_eff > 4096 (see kernel_spec.md §4.4); single-pass for k_eff ≤ 4096.
+    Falls back to dense SDPA when N ≤ k_eff (kernel_spec.md §6).
+    """
+    ...
+```
+
+**M5 validation harness entry point:**
+
+```python
+def validate_kernel_equivalence(
+    B: int, H: int, H_kv: int, D: int, N: int, k_eff: int,
+    n_trials: int = 100,
+    seed: int = 42,
+) -> dict:
+    """
+    Runs n_trials random inputs, verifies all three tiers of kernel_spec.md §5.
+
+    Returns dict with:
+      - tier1_max_inf_norm: float    (threshold: 5e-3)
+      - tier1_rmse: float            (threshold: 1e-6)
+      - tier2_ppl_delta_pct: float   (threshold: 0.05%, requires full trace)
+      - tier3_index_agreement: float (threshold: 0.999)
+      - tier3_uq_cosine_min: float   (threshold: 0.9999)
+      - tier3_keff_exact: bool       (must be True)
+      - all_pass: bool
+    """
+    ...
+```
+
+---
+
+## §9. Locked Architectural Decisions
+
+These decisions are binding for M1–M5. Future milestones (M6 benchmarking,
+M7 memory analysis) may revisit if measurement justifies. No revisits in M1–M5
+without architect sign-off.
+
+### §9.1 Pass 2+3 fusion
+
+**Decision: NOT SEPARATELY NEEDED.** The §4.4 single-pass exception already
+covers k_eff ≤ 4096 in one kernel launch (no fusion required, just no split).
+For k_eff > 4096, the two-pass strategy is binding (separate launches for Pass
+1 projection, Pass 2 top-K, Pass 3 fused attention). Fusion of Pass 2+3 not
+considered in M2/M3.
+
+Reasoning:
+- Pass 2 (top-K of [N] bf16 array) is reduction-heavy parallelism
+- Pass 3 (gather + attention over k_eff keys) is matmul-heavy parallelism
+- Fusing would require shared SRAM state between semantically different
+  computations, breaking M5 component-level testability
+- Independent micro-benchmarking required by M6 (Engineering Plan §1.M6)
+
+### §9.2 GQA thread layout
+
+**Decision (binding):**
+
+| Pass | Triton grid | Programs per (b,h_kv) or (b,h) tuple | Rationale |
+|------|------------|--------------------------------------|-----------|
+| Pass 1 (projection) | `(B, H_kv)` = (B, 8) | 1 per (b, h_kv); each computes 4 score arrays for the 4 query heads sharing this KV head | Loads K_cache once per GQA group, amortizing HBM bandwidth (Pass 1 bottleneck) |
+| Pass 2 (top-K) | `(B, H)` = (B, 32) | 1 per (b, h); each independent (per-query-head u_Q → independent ranking) | Cannot share top-K across query heads (different rankings) |
+| Pass 3 (gather + attention) | `(B, H)` = (B, 32) | 1 per (b, h); each gathers from K_cache via indirect addressing | Different selected indices per query head |
+
+The 4× HBM bandwidth savings in Pass 1 is the main GQA optimization. Pass 2/3
+must use full 32 programs because GQA does NOT reduce work for these passes.
+
+Indirect gather in Pass 3 (`K_cache[b, h_kv, indices[b,h,:], :]`) is
+non-coalesced HBM access. Acceptable because k_eff ≪ N — gather size is bounded.
+
+### §9.3 N > 32K scope lock
+
+**Decision: kernel correctness guaranteed for N ≤ 32K, c_floor ≥ 0.1, B ∈ [1, 8].**
+
+N > 32K is future work (Phase 2 of project). Re-derivation required for:
+- §3 numerical bounds: cumulative softmax error scales as √k_eff; current
+  bounds calibrated for k_eff ≤ 16K with margin
+- §4 SRAM analysis: Pass 2 score buffer at fp32 (4N bytes) would reach 256 KB
+  at N = 64K, requiring spilling
+- §6 edge cases: allocator behavior at >10 GB working set, KV cache
+  pagination
+
+If user invokes kernel with N > 32K: M4 integration layer falls through to
+SDPA. Not handled in M2/M3 kernel itself.
+
+### §9.4 FlashDecoding KV-parallel split
+
+**Decision: NO split-K parallelism in M2/M3.**
+
+Reasoning:
+- Split-K adds reduction tree complexity that weakens §5 Tier 1 equivalence
+  bound (`max|O_triton - O_ref| ≤ 5×10⁻³`); bf16 reduction order
+  non-determinism across SMs introduces additional jitter
+- Pass 3 with k_eff = 10K and B_block = 64 produces 156 blocks per (b, h);
+  saturates 1 SM adequately; split-K is throughput optimization, not latency
+- Trade-off (~2–4× throughput vs weakened equivalence claim) decided in M6
+  if measurement shows Pass 3 bandwidth-bound
+
+Phase 1 (M2/M3): single-SM-per-(b,h) Pass 3. M6 may revisit.

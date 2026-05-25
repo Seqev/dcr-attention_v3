@@ -1,0 +1,12 @@
+{
+  "seed": 2,
+  "N": 32000,
+  "c_floor": 0.15,
+  "ppl_baseline_sdpa": 7.634379,
+  "ppl_m1_topk": 7.658501,
+  "delta_ppl_pct": 0.315967,
+  "axis_source": "q_topk_reference",
+  "runtime_baseline_min": 20.93,
+  "runtime_m1_min": 252.99,
+  "gpu": "NVIDIA GeForce RTX 4060 Ti"
+}

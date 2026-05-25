@@ -1,0 +1,15 @@
+{
+  "config_id": "v2_hero_c050_N20000_seed100",
+  "N": 20000,
+  "c_floor": 0.5,
+  "k_eff": 10000,
+  "ppl_baseline_sdpa": 8.142823828852,
+  "ppl_dcr": 8.144777978800649,
+  "delta_ppl_pct": 0.023998430884929537,
+  "axis_source": "q_topk_reference",
+  "seed": 100,
+  "torch_seed": 100,
+  "numpy_seed": 2147483648,
+  "python_seed_state_hash": 6821093889792862720,
+  "timestamp_utc": "2026-05-18T18:22:02.635967"
+}

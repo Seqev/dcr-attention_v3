@@ -1,0 +1,78 @@
+{
+  "summary": {
+    "config": "P1a N=32000 c=0.15 M1_q_topk_reference",
+    "seeds_tested": [
+      0,
+      1,
+      2,
+      42,
+      100
+    ],
+    "deltas_ppl_pct": [
+      0.561,
+      0.363591,
+      0.315967,
+      0.421982,
+      0.479132
+    ],
+    "n_seeds": 5,
+    "mean_delta_pct": 0.428334,
+    "std_delta_pct": 0.096228,
+    "min_delta_pct": 0.315967,
+    "max_delta_pct": 0.561,
+    "single_seed_ref_pct": 0.561,
+    "drift_from_single_seed_pp": -0.132666,
+    "classification": "STRICT",
+    "verdict": "HERO_CONFIRMED"
+  },
+  "per_seed": [
+    {
+      "seed": 1,
+      "N": 32000,
+      "c_floor": 0.15,
+      "ppl_baseline_sdpa": 7.626194,
+      "ppl_m1_topk": 7.653922,
+      "delta_ppl_pct": 0.363591,
+      "axis_source": "q_topk_reference",
+      "runtime_baseline_min": 23.34,
+      "runtime_m1_min": 256.19,
+      "gpu": "NVIDIA GeForce RTX 4060 Ti"
+    },
+    {
+      "seed": 2,
+      "N": 32000,
+      "c_floor": 0.15,
+      "ppl_baseline_sdpa": 7.634379,
+      "ppl_m1_topk": 7.658501,
+      "delta_ppl_pct": 0.315967,
+      "axis_source": "q_topk_reference",
+      "runtime_baseline_min": 20.93,
+      "runtime_m1_min": 252.99,
+      "gpu": "NVIDIA GeForce RTX 4060 Ti"
+    },
+    {
+      "seed": 42,
+      "N": 32000,
+      "c_floor": 0.15,
+      "ppl_baseline_sdpa": 7.535088,
+      "ppl_m1_topk": 7.566885,
+      "delta_ppl_pct": 0.421982,
+      "axis_source": "q_topk_reference",
+      "runtime_baseline_min": 22.29,
+      "runtime_m1_min": 241.26,
+      "gpu": "NVIDIA GeForce RTX 4060 Ti"
+    },
+    {
+      "seed": 100,
+      "N": 32000,
+      "c_floor": 0.15,
+      "ppl_baseline_sdpa": 8.567507,
+      "ppl_m1_topk": 8.608556,
+      "delta_ppl_pct": 0.479132,
+      "axis_source": "q_topk_reference",
+      "runtime_baseline_min": 20.5,
+      "runtime_m1_min": 247.75,
+      "gpu": "NVIDIA GeForce RTX 4060 Ti"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "config": "N=32000, c=0.1, axis=q_topk_reference",
+  "seeds": [
+    0,
+    1,
+    42
+  ],
+  "phase_1_5_single_seed_ref": 0.9693,
+  "mean_delta_pct": 1.078474,
+  "std_delta_pct": 0.148954,
+  "min_delta_pct": 0.969294,
+  "max_delta_pct": 1.24816,
+  "drift_from_phase15_ref": 0.109174,
+  "stability_verdict": "acceptable",
+  "deployability": "permissive",
+  "per_seed": [
+    {
+      "N": 32000,
+      "c_floor": 0.1,
+      "k_eff": 3200,
+      "ppl_baseline_sdpa": 7.516271,
+      "ppl_m1_topk": 7.589126,
+      "delta_ppl_pct": 0.969294,
+      "deployability": "standard",
+      "runtime_min": 226.18,
+      "gpu": "NVIDIA GeForce RTX 4060 Ti",
+      "axis_source": "q_topk_reference",
+      "seed": 0
+    },
+    {
+      "N": 32000,
+      "c_floor": 0.1,
+      "k_eff": 3200,
+      "ppl_baseline_sdpa": 7.626194,
+      "ppl_m1_topk": 7.703826,
+      "delta_ppl_pct": 1.017967,
+      "deployability": "permissive",
+      "runtime_min": 227.56,
+      "gpu": "NVIDIA GeForce RTX 4060 Ti",
+      "axis_source": "q_topk_reference",
+      "seed": 1
+    },
+    {
+      "N": 32000,
+      "c_floor": 0.1,
+      "k_eff": 3200,
+      "ppl_baseline_sdpa": 7.535088,
+      "ppl_m1_topk": 7.629138,
+      "delta_ppl_pct": 1.24816,
+      "deployability": "permissive",
+      "runtime_min": 232.23,
+      "gpu": "NVIDIA GeForce RTX 4060 Ti",
+      "axis_source": "q_topk_reference",
+      "seed": 42
+    }
+  ]
+}

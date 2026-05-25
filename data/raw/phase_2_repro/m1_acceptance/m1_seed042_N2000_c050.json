@@ -1,0 +1,15 @@
+{
+  "config_id": "m1_c050_N2000_seed042",
+  "N": 2000,
+  "c_floor": 0.5,
+  "k_eff": 1000,
+  "ppl_baseline_sdpa": 11.149595564429859,
+  "ppl_dcr": 11.163743505694413,
+  "delta_ppl_pct": 0.12689196825837717,
+  "axis_source": "q_topk_reference",
+  "seed": 42,
+  "torch_seed": 295150587826605955,
+  "numpy_seed": 2147483648,
+  "python_seed_state_hash": 2932446129207626781,
+  "timestamp_utc": "2026-05-12T15:07:29.246313"
+}

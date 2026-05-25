@@ -1,0 +1,8 @@
+{
+  "mean_m4_delta_pct": 0.16229250442206583,
+  "mean_m1_delta_pct": 0.1782330531964029,
+  "drift_m4_minus_m1_pp": -0.015940548774337066,
+  "drift_cap_pp": 0.15,
+  "v20_published_drift_pp": -0.115,
+  "verdict": "PASS"
+}
