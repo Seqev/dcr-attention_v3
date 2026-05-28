@@ -1,134 +1,60 @@
-# DCR-attention
+# DCR-Attention v3.1
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20385784.svg)](https://doi.org/10.5281/zenodo.20385784)
+Sparse-attention KV-cache work on Llama-3.2-1B (RTX 4060 Ti). This repo
+documents **both what works and what does not** — including findings we
+retracted before publication.
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+## Result
 
-Top-K sparse attention for long-context decode on Llama-3.2-1B.
+At the hero configuration (N=32K, B=4, c=0.15), M-class kernel work moved
+decode latency from sub-parity to above parity vs SDPA:
 
-## Headline result (v3)
+| Path | e2e (ms) | vs SDPA | vs M4 |
+|---|---|---|---|
+| SDPA | 198.64 | 1.000× | — |
+| M4 (v3.0) | 228.43 | 0.870× | 1.000× |
+| **M6 + M5-mixed (v3.1)** | **187.29** | **1.061×** | **1.220×** |
 
-Multi-seed hero deployment point: **N = 32,000 tokens of context,
-coverage floor c = 0.15**, with quality degradation
-**ΔPPL = +0.428% ± 0.096 pp** (5 seeds: {0, 1, 2, 42, 100}; STRICT
-classification on the deployment-tier scale, i.e. ΔPPL ≤ 0.5%).
+Clean theoretical ceiling (0-cost attention kernel): **1.243×**. Production
+captures ~26% of the M4-parity → ceiling gap.
 
-Latency on the reference hardware (RTX 4060 Ti, bf16 inference) at the
-hero operating point: **0.895× SDPA** — characterized as
-*HeroQualityOnly*: quality multi-seed validated; speedup partial. The
-named bottleneck (Pass-3 of the fused 3-pass kernel) and the
-architectural response (ABKV, synthetic-data feasibility demonstrated)
-are documented in §5 of the paper. End-to-end speedup recovery is
-explicit future work.
+Numbers are canonical: 50-iter warmup, 30 timed, 3 randomized-order sessions,
+hero variance 0.098%.
 
-Pre-registered matched-magnitude causal test of the underlying
-entropy-concentration mechanism returns **DESCRIPTIVE** (Wilcoxon
-p = 0.7645, Mann-Whitney U bias check p = 0.272 — generalizable). The
-random-spectrum baseline (untrained K projections) gives α = 1.0000
-± 0.00002 vs α_trained = 0.387, locating α < 1 as a fact about training
-rather than softmax algebra.
+## What the work actually contributes
 
-Full paper: [`paper/main.pdf`](paper/main.pdf).
+The value is in the science, not the speedup. Eight characterized negative
+results:
 
-## What's here
+| # | Statement |
+|---|---|
+| 1 | Synthetic-data quality validation does not transfer to real LLMs. |
+| 2 | Mean-K statistics are dominated by attention sinks; static projection axes are a dead end. |
+| 3 | Index-set overlap is a false quality metric; only output cosine similarity is a valid gate. |
+| 4 | Top-K trajectory drift saturates (~47% by step 50); no warm-start amortization — per-Q-step is structurally necessary. |
+| 5 | Dispatch/non-attention overhead is orthogonal to the algorithmic ratio. |
+| 6 | cuBLAS degrades at small GEMM dims (M=4 GQA): no Tensor-Core engagement, launch overhead dominates. |
+| 7 | INT4 KV is infeasible on 1B-class models; KIVI's <0.1% PPL claim does not scale down (outlier-driven, not sink-driven). |
+| 8 | Sequential benchmarking with low warmup produces ~9% optimistic bias for later-measured paths. Rigorous comparison needs randomized-order, high-warmup, multi-session protocols. |
 
-| Directory | Contents |
-|-----------|----------|
-| `paper/` | v3 paper source (`main.tex`), compiled PDF (`main.pdf`), per-section `.tex` files, figures |
-| `dcr_attention/` | M4 Triton fused top-K kernel + reference implementations + Llama integration |
-| `tests/` | acceptance tests + integration tests + the six causal-pilot iteration scripts |
-| `scripts/` | analysis scripts (Wilcoxon / Mann-Whitney / dose-response), figure generators, the Phase 5.5 paper-merge script |
-| `data/raw/` | curated measurement JSONs cited by the paper (see `data/raw/README.md` for scope) |
+Postulate 8 is the centerpiece: an earlier intermediate claim of 1.14-1.15×
+hero was corrected to 1.06× by canonical re-measurement. We caught our own
+optimistic bias pre-publication because the project was built to catch it.
+
+## Structure
+
+```
+docs/paper_rewrite_scope_memo.md   Scope memo for the v3.1 paper (incl. retraction ledger)
+results/                           Canonical measurements + key falsification artifacts
+REPRODUCIBILITY.md                 Env, seeds, protocol
+```
 
 ## Status
 
-- **v3 release (this repo):** multi-seed validated, pre-registered
-  DESCRIPTIVE causal verdict, honest sub-parity systems characterization.
-- v1.0 / v2.0 Zenodo DOIs: deleted (sober reset prior to v3 — the
-  single-seed v2.0 numerical headline was reproduced exactly on seed 0
-  in the multi-seed re-validation but sits at the high end of the
-  distribution; the 5-seed mean places it ~30× lower, consistent with
-  a tier-boundary measurement that benefits from multi-seed protocol).
+Work-in-progress. This drop is the **scope memo + measurement artifacts**;
+the full v3.1 manuscript is a separate forthcoming rewrite. The retraction
+ledger (scope memo §5) is kept public deliberately as a discipline record.
 
-## Reproducing measurements
+## Environment
 
-Setup (CUDA-capable GPU recommended; CPU-only mode falls back to small
-contexts):
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt    # see project for exact pin set
-# the project is a standalone package under dcr_attention/
-```
-
-Single-seed acceptance run (the cheapest reproducible measurement, ≈10
-minutes on consumer GPU):
-
-```bash
-PYTHONPATH=. python tests/kernel/test_m1_acceptance.py
-```
-
-Full 5-seed protocol — Phase 2 acceptance configuration (N = 2000,
-c = 0.5):
-
-```bash
-PYTHONPATH=. python tests/integration/test_phase_2_m1_multiseed.py
-PYTHONPATH=. python tests/integration/test_phase_2_m4_multiseed.py
-```
-
-Hero re-run at N = 32K, c = 0.15 (≈4 hours per seed on consumer GPU):
-
-```bash
-PYTHONPATH=. python tests/integration/test_hero_verification_p1a.py
-```
-
-Theorem 3 causal test (≈2–3 GPU-hours for the full grid; the analysis
-script consumes the per-cell JSONs):
-
-```bash
-PYTHONPATH=. python tests/integration/test_theorem3_causal_full.py
-python scripts/theorem3_causal_analysis.py
-```
-
-Each script writes per-seed / per-cell JSONs to `data/raw/...` matching
-the paths cited by the paper. Aggregated summaries are the artifacts
-released here.
-
-## License
-
-Apache 2.0 — see [`LICENSE`](LICENSE).
-
-The project memory commits to a *forward-only kernel* under Apache 2.0;
-this is the canonical license, no internal subdirectory overrides.
-
-## Citation
-
-```bibtex
-@misc{dcr-attention-v3,
-  title  = {DCR-attention: Top-K Sparse Attention for Long-Context Decode
-            on Llama-3.2-1B (v3 Release)},
-  author = {Seqev},
-  year   = {2026},
-  doi    = {10.5281/zenodo.20385784},
-  url    = {https://doi.org/10.5281/zenodo.20385784},
-  
-}
-```
-
-(Zenodo DOI and arXiv ID will be added in subsequent release phases.)
-
-## Reproducibility chain
-
-Every quantitative claim in `paper/main.pdf` is traced to a JSON under
-`data/raw/...` and verifiable by re-running the corresponding script
-under `tests/` or `scripts/`. The paper's §4 Tables 9–13 cite per-seed
-JSON paths in their captions; the Phase 6 audit verified zero
-unresolved cross-references in the compiled paper.
-
-## Scope
-
-DCR-attention is one model (Llama-3.2-1B), one dataset (WikiText-2),
-one task (next-token NLL), one hardware class (RTX 4060 Ti). Numerical
-hero values may shift on other configurations; the multi-seed protocol
-itself transfers. See paper §6.3 Limitations for the explicit scope
-boundaries.
+Llama-3.2-1B · RTX 4060 Ti · torch 2.5.1+cu121 · triton 3.1.0 · seed 0
