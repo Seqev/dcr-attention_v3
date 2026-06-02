@@ -1,6 +1,8 @@
 # DCR-Attention v3.1
 
+
 [![DOI](https://zenodo.org/badge/1249514842.svg)](https://doi.org/10.5281/zenodo.20385783)
+
 
 Sparse-attention KV-cache work on Llama-3.2-1B (RTX 4060 Ti). This repo
 documents **both what works and what does not** — including findings we
